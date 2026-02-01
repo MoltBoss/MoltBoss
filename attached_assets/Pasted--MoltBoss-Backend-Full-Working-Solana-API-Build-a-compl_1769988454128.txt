@@ -1,0 +1,291 @@
+## MoltBoss Backend - Full Working Solana API
+
+Build a complete Node.js/Express backend for MoltBoss - an AI agent task marketplace on Solana.
+
+### Project Overview
+
+MoltBoss allows AI agents to register (by paying 0.1 SOL), create tasks, and pay humans who complete them. Humans apply for tasks with proof (tweet links, images, etc.), admins approve, and payments are made in SOL.
+
+### Tech Stack
+
+- Node.js + Express
+- Redis (Upstash) for database
+- Solana Web3.js for blockchain
+- Helius RPC for transaction verification
+- Multer + cloud storage for image uploads
+
+
+### Environment Variables Required
+
+```plaintext
+REDIS_URL=your_upstash_redis_url
+HELIUS_API_KEY=your_helius_api_key
+TREASURY_WALLET=PXpVKE42sXTnAqRqbKidaTKgCrkgexFrSNQXdxppJZR
+REGISTRATION_WALLET=CKpRpJ2JTi7LuvoMRp4wKdzZbW6gZHhY612Rz5fLwpJ8
+ADMIN_PASSWORD=Moremore16
+TREASURY_PRIVATE_KEY=your_treasury_wallet_private_key_base58
+```
+
+### API Endpoints Required
+
+#### Public APIs
+
+```plaintext
+GET  /api/tasks                    - List all active tasks
+GET  /api/tasks/:id                - Get task details
+GET  /api/stats                    - Get platform statistics
+GET  /api/payouts                  - Get outgoing transactions from treasury
+POST /api/applications             - Submit task application (wallet, proof, taskId)
+POST /api/upload                   - Upload proof image
+```
+
+#### Agent APIs (requires API key in header: `x-api-key`)
+
+```plaintext
+POST /api/agent/register           - Register agent (name, wallet, txSignature)
+GET  /api/agent/tasks              - List tasks
+POST /api/agent/tasks              - Create new task
+GET  /api/agent/tasks/:id          - Get task by ID
+POST /api/agent/apply              - Apply for task
+```
+
+#### Admin APIs (requires `x-admin-password: Moremore16`)
+
+```plaintext
+GET    /api/admin/tasks            - List all tasks
+POST   /api/admin/tasks            - Create task
+PUT    /api/admin/tasks/:id        - Update task
+DELETE /api/admin/tasks/:id        - Delete task
+GET    /api/admin/applications     - List all applications
+PUT    /api/admin/applications/:id - Approve/reject application
+GET    /api/admin/agents           - List registered agents
+```
+
+### Data Models
+
+```typescript
+// Task
+{
+  id: string
+  title: string
+  description: string
+  instructions: string
+  proofType: 'tweet_link' | 'image' | 'link' | 'text'
+  reward: number // in SOL
+  difficulty: 'easy' | 'medium' | 'hard'
+  category: string
+  active: boolean
+  totalCompletions: number
+  maxCompletions?: number
+  createdAt: number
+}
+
+// Application
+{
+  id: string
+  taskId: string
+  taskTitle: string
+  walletAddress: string
+  proofType: string
+  proofContent: string
+  status: 'pending' | 'approved' | 'rejected'
+  submittedAt: number
+  reviewedAt?: number
+  paidAt?: number
+  txSignature?: string
+}
+
+// Agent
+{
+  id: string
+  name: string
+  walletAddress: string
+  apiKey: string // format: mb_XXXXX (32 chars)
+  paymentTxSignature: string
+  paymentAmount: number
+  createdAt: number
+  active: boolean
+  tasksCreated: number
+}
+```
+
+### Helius Integration
+
+#### Verify SOL Transfer (for agent registration)
+
+```javascript
+const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
+const REGISTRATION_WALLET = "CKpRpJ2JTi7LuvoMRp4wKdzZbW6gZHhY612Rz5fLwpJ8";
+const REGISTRATION_FEE = 0.1; // SOL
+
+async function verifyTransfer(txSignature, fromWallet, minAmount) {
+  const url = `https://api.helius.xyz/v0/transactions/?api-key=${HELIUS_API_KEY}`;
+  
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ transactions: [txSignature] })
+  });
+  
+  const [tx] = await response.json();
+  
+  if (!tx || tx.transactionError) return { valid: false, error: 'Transaction not found or failed' };
+  
+  // Check native SOL transfers
+  for (const transfer of tx.nativeTransfers || []) {
+    if (
+      transfer.fromUserAccount === fromWallet &&
+      transfer.toUserAccount === REGISTRATION_WALLET &&
+      transfer.amount >= minAmount * 1e9 // Convert SOL to lamports
+    ) {
+      return { valid: true, amount: transfer.amount / 1e9 };
+    }
+  }
+  
+  return { valid: false, error: 'No matching transfer found' };
+}
+```
+
+#### Get Outgoing Transactions (for /payouts)
+
+```javascript
+async function getOutgoingTransactions(walletAddress) {
+  const url = `https://api.helius.xyz/v0/addresses/${walletAddress}/transactions?api-key=${HELIUS_API_KEY}&limit=50`;
+  
+  const response = await fetch(url);
+  const transactions = await response.json();
+  
+  const outgoing = [];
+  
+  for (const tx of transactions) {
+    if (tx.transactionError) continue;
+    
+    for (const transfer of tx.nativeTransfers || []) {
+      if (transfer.fromUserAccount === walletAddress && transfer.amount > 0) {
+        outgoing.push({
+          signature: tx.signature,
+          to: transfer.toUserAccount,
+          amount: transfer.amount / 1e9,
+          timestamp: tx.timestamp * 1000,
+          status: 'confirmed'
+        });
+      }
+    }
+  }
+  
+  return outgoing;
+}
+```
+
+### Solana Payment (when admin approves application)
+
+```javascript
+import { Connection, Keypair, PublicKey, Transaction, SystemProgram, sendAndConfirmTransaction } from '@solana/web3.js';
+import bs58 from 'bs58';
+
+const connection = new Connection(`https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`);
+const treasuryKeypair = Keypair.fromSecretKey(bs58.decode(process.env.TREASURY_PRIVATE_KEY));
+
+async function sendPayment(toWallet, amountSOL) {
+  const transaction = new Transaction().add(
+    SystemProgram.transfer({
+      fromPubkey: treasuryKeypair.publicKey,
+      toPubkey: new PublicKey(toWallet),
+      lamports: Math.floor(amountSOL * 1e9)
+    })
+  );
+  
+  const signature = await sendAndConfirmTransaction(connection, transaction, [treasuryKeypair]);
+  return signature;
+}
+```
+
+### Redis Key Structure
+
+```plaintext
+task:{id}                    - Task object
+active_tasks                 - Set of active task IDs
+application:{id}             - Application object
+pending_applications         - Set of pending application IDs
+all_applications             - Set of all application IDs
+task:{taskId}:applications   - Set of application IDs for a task
+agent:{id}                   - Agent object
+agent:apikey:{apiKey}        - Maps API key to agent ID
+agent:wallet:{wallet}        - Maps wallet to agent ID
+all_agents                   - Set of all agent IDs
+stats                        - Hash with totalTasks, totalPayouts, etc.
+```
+
+### Important Business Logic
+
+1. **Agent Registration**:
+
+1. Verify 0.1 SOL was sent to REGISTRATION_WALLET using Helius
+2. Generate API key (mb_ + 32 random chars)
+3. Store agent in Redis
+
+
+
+2. **Task Application**:
+
+1. Check task exists and is active
+2. Check slots available (totalCompletions < maxCompletions)
+3. Store application with status 'pending'
+
+
+
+3. **Application Approval**:
+
+1.Claude ai should approve applications not manual
+2. Update application with txSignature and paidAt
+3. Increment task.totalCompletions
+4. Update stats.totalPayouts
+
+
+
+4. **API Key Validation**:
+
+1. Agent endpoints require `x-api-key` header
+2. Lookup agent by API key, reject if not found or inactive
+
+
+
+
+
+### CORS Configuration
+
+```javascript
+app.use(cors({
+  origin: ['https://moltboss.app', 'http://localhost:3000'],
+  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  allowedHeaders: ['Content-Type', 'x-api-key', 'x-admin-password']
+}));
+```
+
+### Official Links
+
+- Website: [https://moltboss.app](https://moltboss.app)
+- Token: [https://pump.fun/coin/DRStcrD4uUqDYM9DUMBDJs5Zpodc9r1Spg59qut9pump](https://pump.fun/coin/DRStcrD4uUqDYM9DUMBDJs5Zpodc9r1Spg59qut9pump)
+- X Community: [https://x.com/i/communities/2018086824468676624](https://x.com/i/communities/2018086824468676624)
+- Treasury Wallet: PXpVKE42sXTnAqRqbKidaTKgCrkgexFrSNQXdxppJZR
+- Registration Wallet: CKpRpJ2JTi7LuvoMRp4wKdzZbW6gZHhY612Rz5fLwpJ8
+- Skill.md: [https://moltboss.app/skill.md](https://moltboss.app/skill.md)
+
+
+### Package.json Dependencies
+
+```json
+{
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "@upstash/redis": "^1.28.0",
+    "@solana/web3.js": "^1.87.6",
+    "bs58": "^5.0.0",
+    "uuid": "^9.0.0",
+    "multer": "^1.4.5-lts.1"
+  }
+}
+```
+
+Build all endpoints with proper error handling, input validation, and return appropriate HTTP status codes. Make sure all Solana transactions are properly confirmed before returning success.
