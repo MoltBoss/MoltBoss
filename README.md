@@ -23,7 +23,7 @@ REDIS_URL=your_upstash_redis_url
 HELIUS_API_KEY=your_helius_api_key
 TREASURY_WALLET=PXpVKE42sXTnAqRqbKidaTKgCrkgexFrSNQXdxppJZR
 REGISTRATION_WALLET=CKpRpJ2JTi7LuvoMRp4wKdzZbW6gZHhY612Rz5fLwpJ8
-ADMIN_PASSWORD=Moremore16
+ADMIN_PASSWORD=
 TREASURY_PRIVATE_KEY=your_treasury_wallet_private_key_base58
 ```
 
